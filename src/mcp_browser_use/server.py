@@ -22,7 +22,7 @@ try:
 except Exception:  # pragma: no cover
     markdownify = None  # type: ignore
 
-from browser_use import Browser  # modern API: Browser == BrowserSession
+from browser_use import Browser
 from mcp.server.fastmcp import FastMCP
 
 from .utils import check_playwright_installation
@@ -119,15 +119,14 @@ async def initialize_browser(headless: bool = False, task: str = "") -> str:
         browser = None
         current_page = None
 
-    # Browser() takes config directly; no BrowserConfig anymore
-    # Docs: https://docs.browser-use.com/customize/browser/all-parameters
+    # Browser() takes config directly in modern API
     browser = Browser(headless=headless)
     await browser.start()
     current_page = await browser.new_page("about:blank")
     _selector_map.clear()
     _last_inspected_url = None
 
-    # Simple system guidance string (we removed legacy MessageManager/SystemPrompt)
+    # Simple system guidance string
     actions = (
         "initialize_browser, close_browser, search_google, go_to_url, go_back, wait, "
         "click_element, input_text, switch_tab, open_tab, inspect_page, scroll_down, "
@@ -269,10 +268,31 @@ async def inspect_page() -> str:
       return items;
     }
     """
-    elements: List[Dict[str, Any]] = await page.evaluate(js)  # type: ignore
+    result = await page.evaluate(js)  # type: ignore
     _selector_map.clear()
+
+    # Handle case where result might be a string (error) or list
+    if isinstance(result, str):
+        # Try to parse as JSON if it looks like an array
+        if result.strip().startswith('[') and result.strip().endswith(']'):
+            try:
+                import json
+                result = json.loads(result)
+            except json.JSONDecodeError:
+                logger.error(f"JavaScript evaluation returned unparseable string: {result}")
+                return "Error extracting elements from page. Page might not be fully loaded."
+        else:
+            logger.error(f"JavaScript evaluation returned string: {result}")
+            return "Error extracting elements from page. Page might not be fully loaded."
+
+    if not isinstance(result, list):
+        logger.error(f"JavaScript evaluation returned unexpected type: {type(result)}")
+        return "Error extracting elements from page."
+
+    elements: List[Dict[str, Any]] = result
     for i, item in enumerate(elements, start=1):
-        _selector_map[i] = item["selector"]
+        if isinstance(item, dict) and "selector" in item:
+            _selector_map[i] = item["selector"]
     _last_inspected_url = await page.get_url()
 
     if not elements:
@@ -301,7 +321,8 @@ async def click_element(index: int) -> str:
     el = el_list[0]
 
     el_type = (await el.get_attribute("type")) or ""
-    if (await el.get_attribute("tag")) == "input" and el_type.lower() == "file":
+    el_tag = (await el.get_attribute("tagName")) or ""
+    if el_tag.lower() == "input" and el_type.lower() == "file":
         return f"Index {index} opens a file picker. Use a dedicated upload tool."
 
     # Detect new tab opening
