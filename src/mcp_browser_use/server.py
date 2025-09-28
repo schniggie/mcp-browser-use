@@ -3,509 +3,562 @@
 import asyncio
 import logging
 import sys
-from typing import Optional
+import json
+from typing import Dict, Optional, Any, List
+from urllib.parse import quote as url_quote
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# Keep third-party logging quiet
 logging.getLogger("browser_use").setLevel(logging.CRITICAL)
 logging.getLogger("playwright").setLevel(logging.CRITICAL)
 
-import json
+# Optional dependency; we'll fallback gracefully if missing
+try:
+    import markdownify  # type: ignore
+except Exception:  # pragma: no cover
+    markdownify = None  # type: ignore
 
-import markdownify
-from browser_use.agent.message_manager.service import MessageManager
-from browser_use.agent.prompts import AgentMessagePrompt, SystemPrompt
-from browser_use.browser.browser import Browser, BrowserConfig
-from browser_use.browser.context import BrowserContext
+from browser_use import Browser  # modern API: Browser == BrowserSession
 from mcp.server.fastmcp import FastMCP
 
 from .utils import check_playwright_installation
 
+# -----------------------------------------------------------------------------
+# MCP wiring
+# -----------------------------------------------------------------------------
 mcp = FastMCP("browser_use")
 
+# -----------------------------------------------------------------------------
+# Global state (single-process MCP server, keep this simple)
+# -----------------------------------------------------------------------------
 browser: Optional[Browser] = None
-browser_context: Optional[BrowserContext] = None
-message_manager: Optional[MessageManager] = None
+current_page: Optional[Any] = None  # browser_use Actor Page
+# index -> unique CSS selector (we re-query each time to avoid stale handles)
+_selector_map: Dict[int, str] = {}
+_last_inspected_url: Optional[str] = None
 
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+async def _require_browser() -> Browser:
+    global browser
+    if browser is None:
+        raise RuntimeError("Browser not initialized. Call initialize_browser first.")
+    return browser
+
+
+async def _require_page() -> Any:
+    global current_page
+    b = await _require_browser()
+    if current_page is None:
+        current_page = await b.new_page()
+    return current_page
+
+
+def _reset_index_if_navigated(new_url: Optional[str]) -> None:
+    global _selector_map, _last_inspected_url
+    if new_url and _last_inspected_url and new_url != _last_inspected_url:
+        _selector_map.clear()
+        _last_inspected_url = new_url
+
+
+async def _refresh_current_url() -> Optional[str]:
+    try:
+        page = await _require_page()
+        return await page.get_url()
+    except Exception:
+        return None
+
+
+def _format_element_line(idx: int, meta: Dict[str, Any]) -> str:
+    # show a compact, helpful label
+    tag = meta.get("tag", "").lower()
+    typ = meta.get("type", "")
+    role = meta.get("role", "")
+    placeholder = meta.get("placeholder") or ""
+    title = meta.get("title") or ""
+    aria = meta.get("ariaLabel") or ""
+    text = (meta.get("text") or "").strip()
+    text = " ".join(text.split())  # collapse whitespace
+    preview = text[:120] + ("…" if len(text) > 120 else "")
+    bits: List[str] = [f"{idx}: <{tag}{(' type='+typ) if typ else ''}>"]
+    if role:
+        bits.append(f"[role={role}]")
+    if placeholder:
+        bits.append(f'placeholder="{placeholder}"')
+    if aria:
+        bits.append(f'aria-label="{aria}"')
+    if title:
+        bits.append(f'title="{title}"')
+    if preview:
+        bits.append(f"text={json.dumps(preview)}")
+    return "  ".join(bits)
+
+
+# -----------------------------------------------------------------------------
+# Tools
+# -----------------------------------------------------------------------------
 @mcp.tool()
 async def initialize_browser(headless: bool = False, task: str = "") -> str:
-    """Initialize a new browser instance.
-    Args:
-        headless: Whether to run browser in headless mode
-        task: The task to be performed
-    Returns:
-        Status message
     """
-    global browser, browser_context
-
-    if browser:
-        await close_browser()
-
-    config = BrowserConfig(headless=headless)
-    browser = Browser(config=config)
-    browser_context = BrowserContext(browser=browser)
-
-    system_prompt = SystemPrompt(
-        action_description=(
-            "Available actions: initialize_browser, close_browser, search_google, go_to_url, go_back, wait, click_element, input_text, "
-            "switch_tab, open_tab, inspect_page, scroll_down, scroll_up, send_keys, scroll_to_text, "
-            "get_dropdown_options, select_dropdown_option, validate_page, done"
-        )
-    ).get_system_message()
-
-    browser_system_prompt = f"""
-        {system_prompt.text()}
-        Your ultimate task is: {task}.
-        If you achieved your ultimate task, stop everything and use the done tool to complete the task.
-        If not, continue as usual.
+    Initialize a new browser instance (latest browser-use API).
     """
+    global browser, current_page, _selector_map, _last_inspected_url
 
-    return browser_system_prompt
+    if browser is not None:
+        # Cleanly stop previous session
+        try:
+            await browser.stop()
+        except Exception:
+            pass
+        browser = None
+        current_page = None
+
+    # Browser() takes config directly; no BrowserConfig anymore
+    # Docs: https://docs.browser-use.com/customize/browser/all-parameters
+    browser = Browser(headless=headless)
+    await browser.start()
+    current_page = await browser.new_page("about:blank")
+    _selector_map.clear()
+    _last_inspected_url = None
+
+    # Simple system guidance string (we removed legacy MessageManager/SystemPrompt)
+    actions = (
+        "initialize_browser, close_browser, search_google, go_to_url, go_back, wait, "
+        "click_element, input_text, switch_tab, open_tab, inspect_page, scroll_down, "
+        "scroll_up, send_keys, scroll_to_text, get_dropdown_options, "
+        "select_dropdown_option, validate_page, execute_javascript, done"
+    )
+    return (
+        f"You can control a real browser with direct tools. Available actions: {actions}.\n"
+        f"Your ultimate task is: {task}\n"
+        f"If the task is achieved, call done()."
+    )
 
 
 @mcp.tool()
 async def close_browser() -> str:
-    """Close the current browser instance.
-    Returns:
-        Status message
-    """
-    global browser, browser_context
-
-    if browser_context:
-        await browser_context.close()
-        browser_context = None
-
-    if browser:
-        await browser.close()
-        browser = None
-
+    """Close the current browser instance."""
+    global browser, current_page, _selector_map, _last_inspected_url
+    if browser is not None:
+        try:
+            await browser.stop()
+        finally:
+            browser = None
+            current_page = None
+            _selector_map.clear()
+            _last_inspected_url = None
     return "Browser closed successfully"
 
 
 @mcp.tool()
 async def search_google(query: str) -> str:
-    """
-    Search the query in Google in the current tab.
-    Args:
-        query (str): The search query to use in Google
-    Returns:
-        str: A message confirming the search was performed
-    """
-    page = await browser_context.get_current_page()
-    await page.goto(f"https://www.google.com/search?q={query}&udm=14")
-    await page.wait_for_load_state()
+    """Search the query on Google in the current tab."""
+    page = await _require_page()
+    url = f"https://www.google.com/search?q={url_quote(query)}&udm=14"
+    await page.goto(url)
+    await asyncio.sleep(0.5)
+    _selector_map.clear()
     return f'🔍 Searched for "{query}" in Google'
 
 
 @mcp.tool()
 async def go_to_url(url: str) -> str:
-    """
-    Navigate to URL in the current tab.
-    Args:
-        url (str): The URL to navigate to
-    Returns:
-        str: A message confirming navigation
-    """
-    page = await browser_context.get_current_page()
+    """Navigate to URL in the current tab."""
+    page = await _require_page()
     await page.goto(url)
-    await page.wait_for_load_state()
+    await asyncio.sleep(0.5)
+    _selector_map.clear()
     return f"🔗 Navigated to {url}"
 
 
 @mcp.tool()
 async def go_back() -> str:
-    """
-    Go back to the previous page.
-    Returns:
-        str: A message confirming navigation back
-    """
-    await browser_context.go_back()
+    """Go back to the previous page."""
+    page = await _require_page()
+    await page.go_back()
+    await asyncio.sleep(0.3)
+    _selector_map.clear()
     return "🔙 Navigated back"
 
 
 @mcp.tool()
 async def wait(seconds: int = 3) -> str:
-    """
-    Wait for the specified number of seconds.
-    Args:
-        seconds (int, optional): Number of seconds to wait. Defaults to 3.
-    Returns:
-        str: A message confirming the wait
-    """
+    """Wait for a bit."""
     await asyncio.sleep(seconds)
     return f"🕒 Waiting for {seconds} seconds"
-
-
-@mcp.tool()
-async def click_element(index: int) -> str:
-    """
-    Click the element with the specified index.
-    Args:
-        index (int): The index of the element to click
-    Returns:
-        str: A message describing the result of the click action
-    """
-    if index not in await browser_context.get_selector_map():
-        raise Exception(
-            f"Element with index {index} does not exist - retry or use alternative actions"
-        )
-
-    element_node = await browser_context.get_dom_element_by_index(index)
-    session = await browser_context.get_session()
-    initial_pages = len(session.context.pages)
-
-    # Check if element is a file uploader
-    if await browser_context.is_file_uploader(element_node):
-        return f"Index {index} - has an element which opens file upload dialog. Use a dedicated function for file uploads"
-
-    try:
-        download_path = await browser_context._click_element_node(element_node)
-        if download_path:
-            msg = f"💾 Downloaded file to {download_path}"
-        else:
-            msg = f"🖱️ Clicked button with index {index}: {element_node.get_all_text_till_next_clickable_element(max_depth=2)}"
-
-        # Handle new tab opening
-        if len(session.context.pages) > initial_pages:
-            msg += " - New tab opened - switching to it"
-            await browser_context.switch_to_tab(-1)
-
-        return msg
-    except Exception as e:
-        if "Element not found" in str(e) or "Failed to click element" in str(e):
-            # Wait a moment and try again
-            await asyncio.sleep(1)
-            try:
-                download_path = await browser_context._click_element_node(element_node)
-                if download_path:
-                    msg = f"💾 Downloaded file to {download_path}"
-                else:
-                    msg = f"🖱️ Clicked button with index {index}: {element_node.get_all_text_till_next_clickable_element(max_depth=2)}"
-
-                # Handle new tab opening
-                if len(session.context.pages) > initial_pages:
-                    msg += " - New tab opened - switching to it"
-                    await browser_context.switch_to_tab(-1)
-
-                return msg
-            except Exception:
-                raise Exception(
-                    f"Failed to click element with index {index} even after waiting: {str(e)}"
-                )
-        else:
-            return f"Error clicking element with index {index}: {str(e)}. Call inspect_page() and try finding the element again."
-
-
-@mcp.tool()
-async def input_text(index: int, text: str, has_sensitive_data: bool = False) -> str:
-    """
-    Input text into an interactive element at the specified index.
-    Args:
-        index (int): The index of the element to input text into
-        text (str): The text to input
-        has_sensitive_data (bool, optional): Whether the text is sensitive data. Defaults to False.
-    Returns:
-        str: A message confirming the text input
-    """
-    if index not in await browser_context.get_selector_map():
-        raise Exception(
-            f"Element index {index} does not exist - retry or use alternative actions"
-        )
-
-    element_node = await browser_context.get_dom_element_by_index(index)
-    await browser_context._input_text_element_node(element_node, text)
-
-    if not has_sensitive_data:
-        return f"⌨️ Input {text} into index {index}"
-    else:
-        return f"⌨️ Input sensitive data into index {index}"
-
-
-@mcp.tool()
-async def switch_tab(page_id: int) -> str:
-    """
-    Switch to the tab with the specified page ID.
-    Args:
-        page_id (int): The ID of the page to switch to
-    Returns:
-        str: A message confirming the tab switch
-    """
-    await browser_context.switch_to_tab(page_id)
-    page = await browser_context.get_current_page()
-    await page.wait_for_load_state()
-    return f"🔄 Switched to tab {page_id}"
-
-
-@mcp.tool()
-async def open_tab(url: str) -> str:
-    """
-    Open a URL in a new tab.
-    Args:
-        url (str): The URL to open in the new tab
-    Returns:
-        str: A message confirming the new tab was opened
-    """
-    await browser_context.create_new_tab(url)
-    return f"🔗 Opened new tab with {url}"
 
 
 @mcp.tool()
 async def inspect_page() -> str:
     """
     Lists interactive elements and extracts content from the current page.
-    Returns:
-        str: A formatted string that lists all interactive elements (if any) along with the content.
+    Creates a stable index→selector map for follow-up actions.
     """
-    # Get the current state to inspect interactive elements
-    state = await browser_context.get_state()
-    prompt_message = AgentMessagePrompt(
-        state,
-        include_attributes=["type", "role", "placeholder", "aria-label", "title"],
-    ).get_user_message(use_vision=False)
-    return prompt_message.content
+    global _selector_map, _last_inspected_url
+
+    page = await _require_page()
+    # Collect interactive/meaningful elements (visible only) and compute a unique-ish CSS path
+    js = r"""
+    () => {
+      const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+               style.visibility !== 'hidden' && style.display !== 'none';
+      };
+
+      const cssPath = (el) => {
+        // generate a fairly unique CSS selector for the element
+        if (!(el instanceof Element)) return '';
+        const path = [];
+        while (el && el.nodeType === Node.ELEMENT_NODE && path.length < 8) {
+          let selector = el.nodeName.toLowerCase();
+          if (el.id) {
+            selector += '#' + CSS.escape(el.id);
+            path.unshift(selector);
+            break;
+          } else {
+            let sib = el, nth = 1;
+            while (sib = sib.previousElementSibling) {
+              if (sib.nodeName.toLowerCase() === selector) nth++;
+            }
+            selector += `:nth-of-type(${nth})`;
+          }
+          path.unshift(selector);
+          el = el.parentElement;
+        }
+        return path.join(' > ');
+      };
+
+      const nodes = Array.from(document.querySelectorAll(`
+        a[href],
+        button,
+        input:not([type="hidden"]):not([disabled]),
+        textarea:not([disabled]),
+        select:not([disabled]),
+        [role="button"],
+        [contenteditable=""], [contenteditable="true"],
+        [tabindex]:not([tabindex="-1"])
+      `));
+
+      const uniq = new Set();
+      const items = [];
+      for (const el of nodes) {
+        if (!isVisible(el)) continue;
+        const selector = cssPath(el);
+        if (!selector || uniq.has(selector)) continue;
+        uniq.add(selector);
+        const text = (el.innerText || el.value || '').trim();
+        items.push({
+          selector,
+          tag: el.tagName.toLowerCase(),
+          type: el.getAttribute('type') || '',
+          role: el.getAttribute('role') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          title: el.getAttribute('title') || '',
+          ariaLabel: el.getAttribute('aria-label') || '',
+          text,
+        });
+      }
+      return items;
+    }
+    """
+    elements: List[Dict[str, Any]] = await page.evaluate(js)  # type: ignore
+    _selector_map.clear()
+    for i, item in enumerate(elements, start=1):
+        _selector_map[i] = item["selector"]
+    _last_inspected_url = await page.get_url()
+
+    if not elements:
+        return "No interactive elements found on this page."
+    lines = ["Interactive elements:"]
+    lines += [_format_element_line(i, el) for i, el in enumerate(elements, start=1)]
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def scroll_down(amount: int = None) -> str:
-    """
-    Scroll down the page by the specified amount.
-    Args:
-        amount (int, optional): Pixels to scroll down. If None, scrolls one page.
-    Returns:
-        str: A message confirming the scroll action
-    """
-    page = await browser_context.get_current_page()
-    if amount is not None:
-        await page.evaluate(f"window.scrollBy(0, {amount});")
+async def click_element(index: int) -> str:
+    """Click the element with the specified index (from inspect_page)."""
+    page = await _require_page()
+    if index not in _selector_map:
+        raise Exception(
+            f"Element with index {index} does not exist - call inspect_page() first and retry"
+        )
+
+    selector = _selector_map[index]
+
+    # Pre-check: file upload?
+    el_list = await page.get_elements_by_css_selector(selector)
+    if not el_list:
+        _selector_map.pop(index, None)
+        return f"Index {index}: element not found anymore (page changed). Re-run inspect_page()."
+    el = el_list[0]
+
+    el_type = (await el.get_attribute("type")) or ""
+    if (await el.get_attribute("tag")) == "input" and el_type.lower() == "file":
+        return f"Index {index} opens a file picker. Use a dedicated upload tool."
+
+    # Detect new tab opening
+    before = await (await _require_browser()).get_pages()
+    before_ids = {id(p) for p in before}
+
+    await el.click()
+    await asyncio.sleep(0.3)
+
+    after = await (await _require_browser()).get_pages()
+    after_ids = {id(p) for p in after}
+    new_ids = after_ids - before_ids
+    msg = f"🖱️ Clicked element at index {index}"
+    if new_ids:
+        # Switch to newest page
+        for p in after:
+            if id(p) in new_ids:
+                global current_page
+                current_page = p
+                break
+        _selector_map.clear()
+        msg += " - New tab opened and switched to it."
     else:
-        await page.evaluate("window.scrollBy(0, window.innerHeight);")
-    amount_str = f"{amount} pixels" if amount is not None else "one page"
-    return f"🔍 Scrolled down the page by {amount_str}"
+        # Maybe navigated in place; clear map if URL changed
+        _reset_index_if_navigated(await page.get_url())
+
+    return msg
 
 
 @mcp.tool()
-async def scroll_up(amount: int = None) -> str:
+async def input_text(index: int, text: str, has_sensitive_data: bool = False) -> str:
     """
-    Scroll up the page by the specified amount.
-    Args:
-        amount (int, optional): Pixels to scroll up. If None, scrolls one page.
-    Returns:
-        str: A message confirming the scroll action
+    Input text into an interactive element at the specified index.
     """
-    page = await browser_context.get_current_page()
-    if amount is not None:
-        await page.evaluate(f"window.scrollBy(0, -{amount});")
+    page = await _require_page()
+    if index not in _selector_map:
+        raise Exception(
+            f"Element index {index} does not exist - call inspect_page() first"
+        )
+
+    selector = _selector_map[index]
+    el_list = await page.get_elements_by_css_selector(selector)
+    if not el_list:
+        _selector_map.pop(index, None)
+        return f"Index {index}: element not found anymore. Re-run inspect_page()."
+    el = el_list[0]
+    await el.fill(text)
+    _reset_index_if_navigated(await page.get_url())
+
+    return (
+        f"⌨️ Input sensitive data into index {index}"
+        if has_sensitive_data
+        else f"⌨️ Input {text} into index {index}"
+    )
+
+
+@mcp.tool()
+async def switch_tab(page_id: int) -> str:
+    """
+    Switch to the tab by index (0-based). Use -1 for the last tab.
+    """
+    global current_page
+    b = await _require_browser()
+    pages = await b.get_pages()
+    if not pages:
+        return "No tabs open."
+    if page_id < 0:
+        page_id = len(pages) + page_id
+    if page_id < 0 or page_id >= len(pages):
+        return f"Invalid tab index {page_id}. There are {len(pages)} tabs."
+    current_page = pages[page_id]
+    url = await current_page.get_url()
+    title = await current_page.get_title()
+    _selector_map.clear()
+    return f"🔄 Switched to tab {page_id} ({title or url})"
+
+
+@mcp.tool()
+async def open_tab(url: str) -> str:
+    """Open a URL in a new tab and switch to it."""
+    global current_page
+    b = await _require_browser()
+    current_page = await b.new_page(url)
+    await asyncio.sleep(0.3)
+    _selector_map.clear()
+    return f"🔗 Opened new tab with {url}"
+
+
+@mcp.tool()
+async def scroll_down(amount: Optional[int] = None) -> str:
+    """Scroll down by pixels; if None, one viewport."""
+    page = await _require_page()
+    if amount is None:
+        js = "()=> window.scrollBy(0, window.innerHeight)"
+        await page.evaluate(js)
+        amount = -1  # marker for 'one page'
     else:
-        await page.evaluate("window.scrollBy(0, -window.innerHeight);")
-    amount_str = f"{amount} pixels" if amount is not None else "one page"
-    return f"🔍 Scrolled up the page by {amount_str}"
+        await page.evaluate(f"()=> window.scrollBy(0, {int(amount)})")
+    return f"🔍 Scrolled down the page by {'one page' if amount == -1 else f'{amount} pixels'}"
+
+
+@mcp.tool()
+async def scroll_up(amount: Optional[int] = None) -> str:
+    """Scroll up by pixels; if None, one viewport."""
+    page = await _require_page()
+    if amount is None:
+        js = "()=> window.scrollBy(0, -window.innerHeight)"
+        await page.evaluate(js)
+        amount = -1
+    else:
+        await page.evaluate(f"()=> window.scrollBy(0, -{int(amount)})")
+    return f"🔍 Scrolled up the page by {'one page' if amount == -1 else f'{amount} pixels'}"
 
 
 @mcp.tool()
 async def send_keys(keys: str) -> str:
-    """
-    Send keyboard keys or shortcuts to the current page.
-    Args:
-        keys (str): Keys to send, e.g. "Escape", "Enter", "Control+o"
-    Returns:
-        str: A message confirming the keys were sent
-    """
-    page = await browser_context.get_current_page()
-    try:
-        await page.keyboard.press(keys)
-    except Exception as e:
-        if "Unknown key" in str(e):
-            for key in keys:
-                await page.keyboard.press(key)
-        else:
-            raise e
+    """Send keyboard keys (e.g., 'Enter', 'Control+A')."""
+    page = await _require_page()
+    await page.press(keys)
     return f"⌨️ Sent keys: {keys}"
 
 
 @mcp.tool()
 async def scroll_to_text(text: str) -> str:
     """
-    Scroll to an element containing the specified text.
-    Args:
-        text (str): The text to find and scroll to.
-    Returns:
-        str: A message confirming the scroll action or indicating failure.
+    Scroll to first element containing the given (case-insensitive) text.
     """
-    page = await browser_context.get_current_page()
-    locators = [
-        page.get_by_text(text, exact=False),
-        page.locator(f"text={text}"),
-        page.locator(f"//*[contains(text(), '{text}')]"),
-    ]
-    for locator in locators:
-        try:
-            if await locator.count() > 0 and await locator.first.is_visible():
-                await locator.first.scroll_into_view_if_needed()
-                await asyncio.sleep(0.5)
-                return f"🔍 Scrolled to text: {text}"
-        except Exception:
-            continue
-    return f"Text '{text}' not found or not visible on page"
+    page = await _require_page()
+    js = r"""
+    (needle) => {
+      const n = String(needle).toLowerCase();
+      // Prefer visible text containers
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode(node) {
+            if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+            if (!node.parentElement) return NodeFilter.FILTER_REJECT;
+            const s = node.nodeValue.toLowerCase();
+            if (!s.includes(n)) return NodeFilter.FILTER_SKIP;
+            const el = node.parentElement;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            if (rect.width <= 0 || rect.height <= 0) return NodeFilter.FILTER_SKIP;
+            if (style.visibility === 'hidden' || style.display === 'none') return NodeFilter.FILTER_SKIP;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        }
+      );
+      let node;
+      while ((node = walker.nextNode())) {
+        node.parentElement.scrollIntoView({behavior: 'instant', block: 'center', inline: 'nearest'});
+        return true;
+      }
+      return false;
+    }
+    """
+    found = await page.evaluate(js, text)  # type: ignore
+    return f"🔍 Scrolled to text: {text}" if found else f"Text '{text}' not found or not visible on page"
 
 
 @mcp.tool()
 async def get_dropdown_options(index: int) -> str:
     """
-    Get all options from a dropdown element.
-    Args:
-        index (int): The index of the dropdown element.
-    Returns:
-        str: A formatted string listing all dropdown options.
+    List visible option labels for a <select> element by index from inspect_page().
     """
-    page = await browser_context.get_current_page()
-    selector_map = await browser_context.get_selector_map()
-    dom_element = selector_map[index]
-    all_options = []
-    for frame in page.frames:
-        try:
-            options = await frame.evaluate(
-                """
-                (xpath) => {
-                    const select = document.evaluate(xpath, document, null,
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                    if (!select) return null;
-                    return {
-                        options: Array.from(select.options).map(opt => ({
-                            text: opt.text,
-                            value: opt.value,
-                            index: opt.index
-                        })),
-                        id: select.id,
-                        name: select.name
-                    };
-                }
-                """,
-                dom_element.xpath,
-            )
-            if options:
-                formatted_options = []
-                for opt in options["options"]:
-                    encoded_text = json.dumps(opt["text"])
-                    formatted_options.append(f'{opt["index"]}: text={encoded_text}')
-                all_options.extend(formatted_options)
-        except Exception:
-            pass
-    if all_options:
-        msg = "\n".join(all_options)
-        msg += "\nUse the exact text string in select_dropdown_option"
-        return msg
-    else:
-        return "No options found in any frame for dropdown"
+    page = await _require_page()
+    if index not in _selector_map:
+        return "No such element index. Run inspect_page() first."
+    selector = _selector_map[index]
+    js = r"""
+    (sel) => {
+      const el = document.querySelector(sel);
+      if (!el || el.tagName.toLowerCase() !== 'select') return null;
+      return Array.from(el.options).map((opt, i) => ({
+        idx: i,
+        text: opt.text,
+        value: opt.value
+      }));
+    }
+    """
+    opts = await page.evaluate(js, selector)  # type: ignore
+    if not opts:
+        return f"No options found (or element {index} is not a <select>)."
+    lines = [f"{o['idx']}: text={json.dumps(o['text'])}  value={json.dumps(o['value'])}" for o in opts]
+    lines.append("Use select_dropdown_option(index, text=<visible text>)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 async def select_dropdown_option(index: int, text: str) -> str:
     """
-    Select an option from a dropdown by its text.
-    Args:
-        index (int): The index of the dropdown element.
-        text (str): The exact text of the option to select.
-    Returns:
-        str: A message confirming the option was selected.
+    Select an option from a dropdown by its *visible text*.
     """
-    page = await browser_context.get_current_page()
-    selector_map = await browser_context.get_selector_map()
-    dom_element = selector_map[index]
-    if dom_element.tag_name != "select":
-        return f"Cannot select option: Element with index {index} is a {dom_element.tag_name}, not a select"
-    for frame in page.frames:
-        try:
-            find_dropdown_js = """
-                (xpath) => {
-                    try {
-                        const select = document.evaluate(xpath, document, null,
-                            XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                        if (!select) return null;
-                        if (select.tagName.toLowerCase() !== 'select') {
-                            return { error: `Found element but it's a ${select.tagName}, not a SELECT`, found: false };
-                        }
-                        return {
-                            id: select.id,
-                            name: select.name,
-                            found: true,
-                            tagName: select.tagName,
-                            optionCount: select.options.length,
-                            currentValue: select.value,
-                            availableOptions: Array.from(select.options).map(o => o.text.trim())
-                        };
-                    } catch (e) {
-                        return { error: e.toString(), found: false };
-                    }
-                }
-            """
-            dropdown_info = await frame.evaluate(find_dropdown_js, dom_element.xpath)
-            if dropdown_info and dropdown_info.get("found"):
-                selected_option_values = (
-                    await frame.locator("//" + dom_element.xpath)
-                    .nth(0)
-                    .select_option(label=text, timeout=1000)
-                )
-                return f"Selected option {text} with value {selected_option_values}"
-        except Exception:
-            pass
-    return f"Could not select option '{text}' in any frame"
+    page = await _require_page()
+    if index not in _selector_map:
+        return "No such element index. Run inspect_page() first."
+    selector = _selector_map[index]
+
+    # Resolve visible text -> value in-page, then call Element.select_option(values=value)
+    js_value_for_text = r"""
+    (sel, want) => {
+      const el = document.querySelector(sel);
+      if (!el || el.tagName.toLowerCase() !== 'select') return null;
+      const match = Array.from(el.options).find(o => (o.text || '').trim() === want.trim());
+      return match ? match.value : null;
+    }
+    """
+    value = await page.evaluate(js_value_for_text, selector, text)  # type: ignore
+    if value is None:
+        return f"Could not find option with visible text {json.dumps(text)}."
+
+    elements = await page.get_elements_by_css_selector(selector)
+    if not elements:
+        return f"Select element disappeared; re-run inspect_page()."
+    await elements[0].select_option(value)
+    return f"Selected option {json.dumps(text)} with value {json.dumps(value)}"
 
 
 @mcp.tool()
 async def validate_page(expected_text: str = "") -> str:
     """
-    Validate the current page state by extracting content and optionally checking for expected text.
-    Args:
-        expected_text (str): Optional text expected to be present on the page.
-    Returns:
-        str: A message indicating whether the expected text was found or showing an extracted snippet.
+    Extract page content; optionally assert that expected_text appears.
     """
-    page = await browser_context.get_current_page()
-    content = markdownify.markdownify(await page.content())
-    if expected_text and expected_text.lower() in content.lower():
-        return (
-            f"✅ Validation successful: Expected text '{expected_text}' found on page."
-        )
-    elif expected_text:
-        return f"⚠ Validation warning: Expected text '{expected_text}' not found. Extracted snippet: {content[:200]}..."
-    else:
-        return f"Page content extracted:\n{content[:500]}..."
+    page = await _require_page()
+    html = await page.evaluate("()=> document.documentElement.outerHTML")
+    text_md = None
+    if markdownify:
+        try:
+            text_md = markdownify.markdownify(html)  # type: ignore
+        except Exception:
+            pass
 
+    content_preview = (text_md or html)[:800]
+    if expected_text:
+        found = (text_md or html).lower().find(expected_text.lower()) != -1
+        if found:
+            return f"✅ Validation successful: Expected text '{expected_text}' found on page."
+        return f"⚠ Validation warning: Expected text '{expected_text}' not found.\nExtracted snippet: {content_preview}..."
+    return f"Page content extracted:\n{content_preview}..."
 
-@mcp.tool()
-async def done(success: bool = True, text: str = "") -> dict:
-    """
-    Complete the task with a success flag and optional text.
-    Returns:
-        dict: A dictionary indicating completion status.
-    """
-    return {"is_done": True, "success": success, "extracted_content": text}
 
 @mcp.tool()
 async def execute_javascript(script: str) -> str:
     """
-    Execute JavaScript code on the current page.
-    Args:
-        script (str): The JavaScript code to execute
-    Returns:
-        str: A message with the result of the JavaScript execution
+    Execute JavaScript on the current page.
+    IMPORTANT: pass an arrow function as a string, e.g. '() => document.title'
+    or '(x, y) => x + y'.
     """
-    page = await browser_context.get_current_page()
+    page = await _require_page()
     try:
         result = await page.evaluate(script)
-        
-        # For complex objects, convert to JSON string
         if isinstance(result, (dict, list)):
-            import json
             try:
-                result_str = json.dumps(result, indent=2)
-                return f"📝 JavaScript executed successfully:\n{result_str}"
-            except:
-                # Fallback if JSON serialization fails
+                return "📝 JavaScript executed successfully:\n" + json.dumps(result, indent=2)
+            except Exception:
                 return f"📝 JavaScript executed successfully. Result (non-serializable): {str(result)}"
         else:
             return f"📝 JavaScript executed successfully. Result: {result}"
@@ -513,15 +566,25 @@ async def execute_javascript(script: str) -> str:
         return f"❌ Error executing JavaScript: {str(e)}"
 
 
+@mcp.tool()
+async def done(success: bool = True, text: str = "") -> dict:
+    """Signal completion to the client."""
+    return {"is_done": True, "success": success, "extracted_content": text}
+
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 def main():
     """Run the MCP server"""
     if not check_playwright_installation():
         logger.error("Playwright is not properly installed. Exiting.")
         sys.exit(1)
 
-    logger.info("Starting MCP server for browser-use")
+    logger.info("Starting MCP server for browser-use (modern API)")
     mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
     main()
+
