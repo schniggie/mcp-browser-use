@@ -7,14 +7,34 @@ import json
 from typing import Dict, Optional, Any, List
 from urllib.parse import quote as url_quote
 
+import sys
+
+# Configure logging to stderr to avoid polluting stdout/JSON
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stderr  # Ensure logs go to stderr, not stdout
 )
 logger = logging.getLogger(__name__)
 
 # Keep third-party logging quiet
 logging.getLogger("browser_use").setLevel(logging.CRITICAL)
 logging.getLogger("playwright").setLevel(logging.CRITICAL)
+logging.getLogger("cdp_use").setLevel(logging.CRITICAL)
+
+# Disable debug output from browser-use that goes directly to stdout
+import os
+os.environ["BROWSER_USE_DEBUG"] = "false"
+
+# Override print to filter DEBUG messages
+_original_print = print
+def filtered_print(*args, **kwargs):
+    message = ' '.join(str(arg) for arg in args)
+    if not (message.startswith('DEBUG:') or 'DEBUG: Evaluating JavaScript' in message):
+        _original_print(*args, **kwargs)
+
+# Replace print temporarily during imports to prevent debug pollution
+print = filtered_print
 
 # Optional dependency; we'll fallback gracefully if missing
 try:
@@ -444,7 +464,7 @@ async def switch_tab(page_id: int) -> str:
     """
     Switch to the tab by index (0-based). Use -1 for the last tab.
     """
-    global current_page
+    global current_page, _last_inspected_url
     b = await _require_browser()
     pages = await b.get_pages()
     if not pages:
@@ -453,11 +473,21 @@ async def switch_tab(page_id: int) -> str:
         page_id = len(pages) + page_id
     if page_id < 0 or page_id >= len(pages):
         return f"Invalid tab index {page_id}. There are {len(pages)} tabs."
-    current_page = pages[page_id]
-    url = await current_page.get_url()
-    title = await current_page.get_title()
-    _selector_map.clear()
-    return f"🔄 Switched to tab {page_id} ({title or url})"
+
+    new_page = pages[page_id]
+    new_url = await new_page.get_url()
+    title = await new_page.get_title()
+
+    # Only clear selector map if switching to a different URL than the one we inspected
+    if _last_inspected_url and new_url != _last_inspected_url:
+        _selector_map.clear()
+        _last_inspected_url = None
+        logger.info(f"Cleared selector map when switching from {_last_inspected_url} to {new_url}")
+    else:
+        logger.info(f"Preserving selector map for same URL: {new_url}")
+
+    current_page = new_page
+    return f"🔄 Switched to tab {page_id} ({title or new_url})"
 
 
 @mcp.tool()
@@ -658,6 +688,10 @@ async def done(success: bool = True, text: str = "") -> dict:
 # -----------------------------------------------------------------------------
 def main():
     """Run the MCP server"""
+    # Restore original print function for normal operation
+    global print
+    print = _original_print
+
     if not check_playwright_installation():
         logger.error("Playwright is not properly installed. Exiting.")
         sys.exit(1)
