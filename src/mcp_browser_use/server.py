@@ -119,9 +119,69 @@ async def initialize_browser(headless: bool = False, task: str = "") -> str:
         browser = None
         current_page = None
 
-    # Browser() takes config directly in modern API
-    browser = Browser(headless=headless)
-    await browser.start()
+    # Try different browser configurations for compatibility
+    browser_configs = [
+        # Configuration 1: Robust settings for MCP environment
+        {
+            "headless": headless,
+            "disable_security": True,
+            "chromium_sandbox": False,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor"
+            ]
+        },
+        # Configuration 2: Basic configuration as fallback
+        {
+            "headless": headless,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        },
+        # Configuration 3: Minimal configuration
+        {
+            "headless": headless
+        }
+    ]
+
+    browser = None
+    last_error = None
+
+    for i, browser_config in enumerate(browser_configs):
+        try:
+            logger.info(f"Trying browser configuration {i+1}/3")
+            browser = Browser(**browser_config)
+
+            # Start browser with timeout to avoid hanging
+            start_task = asyncio.create_task(browser.start())
+            await asyncio.wait_for(start_task, timeout=30.0)
+            logger.info(f"Browser started successfully with configuration {i+1}")
+            break
+
+        except asyncio.TimeoutError as e:
+            last_error = f"Configuration {i+1} timed out after 30 seconds"
+            logger.warning(last_error)
+            if browser:
+                try:
+                    await browser.stop()
+                except:
+                    pass
+                browser = None
+
+        except Exception as e:
+            last_error = f"Configuration {i+1} failed: {str(e)}"
+            logger.warning(last_error)
+            if browser:
+                try:
+                    await browser.stop()
+                except:
+                    pass
+                browser = None
+
+    if browser is None:
+        raise RuntimeError(f"Browser initialization failed with all configurations. Last error: {last_error}")
+
     current_page = await browser.new_page("about:blank")
     _selector_map.clear()
     _last_inspected_url = None
